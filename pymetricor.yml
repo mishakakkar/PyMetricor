@@ -1,0 +1,181 @@
+# -----------------------------------------
+#  All Weight-Related Settings
+# -----------------------------------------
+weights:
+  # -----------------------------------------
+  # Overall section weights
+  # These determine how much each parent metric contributes to the final score
+  # -----------------------------------------
+  sections:
+    readability: 0.30
+    efficiency: 0.25
+    maintainability: 0.25
+    security: 0.20
+
+  # -----------------------------------------
+  # Per-file mass calculation
+  # Determines how much file size and structure affects the total file score
+  # -----------------------------------------
+  file_composite:
+    loc: 0.2        # Lines of code
+    tokens: 0.4     # Token count
+    ast_nodes: 0.4  # Number of AST nodes
+
+  # -----------------------------------------
+  # Internal weights for individual metrics
+  # How much each signal contributes to its parent section
+  # -----------------------------------------
+  readability:
+    line_length_distribution: 0.036
+    indentation_stability: 0.036
+    identifier_style: 0.03
+    comment_density: 0.045
+    nesting_depth: 0.03
+    blank_line_rhythm: 0.03
+    annotation_consistency: 0.027
+    string_formatting_consistency: 0.03
+    identifier_length: 0.036
+    cognitive_complexity: 0.30
+    line_density: 0.30
+    identifier_quality: 0.05
+    formatting_consistency: 0.05
+
+  efficiency:
+    cyclomatic_complexity: 0.4
+    redundant_code: 0.3
+    dead_code: 0.3
+
+  maintainability:
+    inheritance_depth: 0.085
+    method_receiver_naming_consistency: 0.085
+    parameter_bloat: 0.17
+    exception_hygiene: 0.13
+    function_length: 0.13
+    class_complexity: 0.25
+    module_coupling: 0.15
+
+  security:
+    broken_cryptography: 0.20
+    arbitrary_code_execution: 0.40
+    unsafe_file_access: 0.20
+    injection_and_request_forgery: 0.20
+
+# -----------------------------------------
+# Internal Metric Tuning
+# NOTE: Higher 'sensitivity' values = stricter / harsher penalties
+# -----------------------------------------
+tuning:
+  # -----------------------------------------
+  # Readability Metrics Fine-Tuning
+  # -----------------------------------------
+  readability:
+    thresholds:
+      preferred_line_length: 100         # Maximum preferred characters per line
+      ideal_comment_ratio: 0.06          # Target ratio of comments to LOC
+      comment_ratio_tolerance: 0.135     # Allowed deviation from ideal comment ratio
+      max_blank_lines: 2                 # Max consecutive blank lines
+      blank_lines_tolerance: 4           # Max number of violating lines before penalties apply
+      max_feasible_nesting: 4            # Max block nesting (def/class/if/for/...) before penalties apply
+      min_function_size: 10              # Minimum lines for a function (or file) to need documentation
+      min_identifier_length: 2           # Names shorter than this count as non-descriptive
+      max_cognitive_complexity: 5        # Cognitive complexity of the worst function before penalties apply
+      max_tokens_per_line: 15            # Tokens on one line before it counts as dense (string literals excluded)
+
+    sensitivity:
+      line_length: 0.05                   # Penalty scaling for long lines
+      indent_stability: 1.0               # Penalty for inconsistent indentation
+      comment_density: 2.2                # Penalty for docstring / comment deficiencies
+      blank_rhythm: 0.15                  # Penalty for irregular blank line spacing
+      nesting_depth: 0.4                  # Penalty for excessive nesting
+      identifier_style: 2.5               # Penalty for style violations (snake_case, PascalCase, etc.)
+      identifier_length: 2.0              # Penalty for the share of non-descriptive (too short) names
+      cognitive_complexity: 0.05          # Penalty per point of cognitive complexity above the threshold
+      line_density: 0.25                  # Penalty for the mean token excess per line
+      identifier_quality: 2.0             # Penalty for the share of names that are not words or known abbreviations
+      formatting_consistency: 2.0         # Penalty for mixed operator spacing, comma spacing and quote style
+      docstring_quality: 0.5              # Penalty for docstring completeness / formatting
+      annotation_consistency: 0.8         # Penalty for consistent type annotation usage
+      string_format_consistency: 1.8      # Penalty for consistent string formatting
+
+    # Identifier naming style rules used by the identifier_style readability metric
+    # Each entry defines the required naming convention for a specific symbol category
+    #
+    # Supported keys:
+    #   function_def        -> regular function definitions
+    #   async_function_def  -> async function definitions
+    #   class_def           -> class definitions
+    #   instance_attr       -> attributes assigned to `self` inside class methods
+    #   variable            -> regular variables across module
+    #
+    # Supported naming styles (case-sensitive):
+    #   CAMEL_CASE
+    #   PASCAL_CASE
+    #   SNAKE_CASE
+    #   KEBAB_CASE
+    #   SCREAMING_SNAKE_CASE
+    #   TRAIN_CASE
+    #   FLATCASE
+    #   UPPERFLATCASE
+    #   COBOL_CASE
+    #
+    # Example: setting `function_def: PASCAL_CASE` requires functions like `MyFunction`,
+    # while `instance_attr: SNAKE_CASE` requires attributes like `user_id`.
+    identifier_style:
+      function_def: SNAKE_CASE
+      async_function_def: SNAKE_CASE
+      class_def: PASCAL_CASE
+      instance_attr: SNAKE_CASE
+      variable: SNAKE_CASE
+
+  # -----------------------------------------
+  # Efficiency Metrics Fine-Tuning
+  # -----------------------------------------
+  efficiency:
+    thresholds:
+      avg_complexity_base: 3.0           # Base cyclomatic complexity where scoring starts to decay
+      min_mass_for_duplication: 3         # Minimum number of lines a node must have to check for duplication
+
+    sensitivity:
+      cyclomatic_complexity: 0.45         # Decay factor for cyclomatic complexity violations
+      redundant_code: 0.3                 # Decay factor for redundant code violations
+      dead_code: 0.35                     # Decay factor for dead code violations
+
+    flags:
+      flag_globals: false                 # Whether to flag unused global identifiers
+      flag_class_public: false            # Whether to flag unused public class members
+
+  # -----------------------------------------
+  # Maintainability Metrics Fine-Tuning
+  # -----------------------------------------
+  maintainability:
+    thresholds:
+      max_parameter_bloat: 4        # Maximum feasible parameters per function/method
+      max_function_length: 50      # Maximum feasible function length (in terms of LOC)
+      max_inheritance_depth: 2      # Maximum feasible inheritance depth for classes
+      max_exception_violations: 0   # Maximum (try-except) exception violations before penalty applies
+      max_class_methods: 6         # Maximum feasible number of methods in a class before complexity penalties apply
+      max_class_attributes: 5      # Maximum feasible number of attributes in a class before complexity penalties apply
+      max_class_bases: 3            # Maximum feasible number of base classes before complexity penalties apply
+      max_fan_out: 4                # Project modules a module may import before coupling penalties apply (p75, PyPI calibration half)
+      max_fan_in: 12                # Project modules that may import a module before coupling penalties apply (p95)
+
+    sensitivity:
+      parameter_bloat: 0.4           # Penalty scaling for exceeding max_parameter_bloat
+      method_receiver_naming: 2.0    # Penalty scaling for inconsistent receiver names in class methods
+      function_length: 0.5           # Penalty scaling for exceeding max_function_length
+      inheritance_depth: 1.2         # Penalty scaling for exceeding max_inheritance_depth
+      exception_violations: 0.5      # Penalty scaling for exceeding max_exception_violations
+      class_complexity: 0.5          # Penalty scaling for excessive class complexity (methods, attributes, inheritance)
+      fan_out: 0.03                  # Penalty per project import above max_fan_out (p99 scores 50)
+      fan_in: 0.013                  # Penalty per importing module above max_fan_in (p99 scores 50)
+      import_cycle: 0.2              # Penalty scaling for being in a load-time import cycle (times log2 of cycle size, capped at 16)
+
+  # -----------------------------------------
+  # Security Metrics Fine-Tuning
+  # -----------------------------------------
+  security:
+    sensitivity:
+      broken_cryptography: 0.5       # Penalty scaling for using deprecated/unsafe crypto functions/methods
+      arbitrary_code_execution: 0.5  # Penalty scaling for using exec/eval functions
+      unsafe_file_access: 0.5        # Penalty scaling for tainted/dynamic paths reaching open()
+      injection_and_request_forgery: 0.5  # Penalty scaling for tainted SQL statements and request URLs

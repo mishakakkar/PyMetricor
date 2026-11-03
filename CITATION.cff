@@ -1,0 +1,22 @@
+cff-version: 1.7.0
+message: "If you use PyMetricor, please cite it as below."
+title: "PyMetricor: a deterministic composite quality score for Python"
+type: software
+version: 1.7.0
+date-released: 2026-11-03
+license: MIT
+repository-code: "https://github.com/Altered-commits/PyMetricor"
+authors:
+  - family-names: Goel
+    given-names: Sujal
+  - family-names: Lalith
+    given-names: Pecheti Charan
+  - family-names: Kakkar
+    given-names: Misha
+  - family-names: Mehrotra
+    given-names: Deepti
+keywords:
+  - static analysis
+  - Python
+  - software quality
+  - taint analysis

@@ -1,0 +1,992 @@
+version: 1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TYPE SYSTEM
+# Defines abstract runtime types. Forms a DAG. No semantics implied.
+# ─────────────────────────────────────────────────────────────────────────────
+types:
+  str:
+    parents: []
+
+  int:
+    parents: []
+
+  bool:
+    parents: [int]
+
+  list:
+    parents: []
+
+  dict:
+    parents: []
+
+  callable:
+    parents: []
+
+  # pathlib paths, so that p.read_text() and friends can be recognised as file access.
+  # A carrier type marks one kind of object: it is set by the functions that build one
+  # (FUNCTION SPECIFICATIONS) and kept only by `/`, by the methods listed in
+  # preserved_by called on it, and by the attributes listed (p.parent). Everything else
+  # derived from it (str(p), p.name, os.path.join(p, x)) is no longer a path.
+  path:
+    parents: []
+    carrier: true
+    preserved_by: [joinpath, resolve, absolute, expanduser, with_name, with_suffix, with_stem, relative_to]
+    attributes: [parent]
+
+  # tarfile archives (tarfile.open, tarfile.TarFile)
+  archive:
+    parents: []
+    carrier: true
+
+  # HTTP client sessions (requests.Session, httpx.Client, aiohttp.ClientSession):
+  # session.get(url) sends a request like requests.get(url)
+  http_client:
+    parents: []
+    carrier: true
+
+  # Jinja sandboxed environments: from_string() on one does not give template injection
+  sandbox_env:
+    parents: []
+    carrier: true
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PROPERTIES SECTION  (Lattice Layer)
+# Defines semantic traits. Join = set union. Meet = intersection.
+# ─────────────────────────────────────────────────────────────────────────────
+properties:
+  CONSTANT:
+    kind: base
+
+  DYNAMIC:
+    kind: base
+
+  EXTERNAL_ORIGIN:
+    kind: base
+
+  TEXTUAL:
+    kind: base
+
+  NUMERIC:
+    kind: base
+
+  BYTES_LIKE:
+    kind: base
+
+  CODE_LIKE:
+    kind: base
+
+  REFLECTIVE:
+    kind: base
+
+  FINITE_DOMAIN:
+    kind: refinement
+    refines: DYNAMIC
+
+  # Set by abspath/realpath/normpath: the path has no '..' left, so a prefix
+  # check on it is a containment check.
+  NORMALIZED:
+    kind: base
+
+  # Set by sanitiser functions (see FUNCTION SPECIFICATIONS). Reporting only;
+  # sanitisers work by removing EXTERNAL_ORIGIN / DYNAMIC.
+  SANITIZED:
+    kind: base
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOURCES
+# Where untrusted data enters without a function call.
+#   attributes : any `x.<attr>` read carries EXTERNAL_ORIGIN (sys.argv, request.form ...)
+#   globals    : names seeded as external at module start (e.g. Flask/Django `request`)
+# ─────────────────────────────────────────────────────────────────────────────
+sources:
+  attributes: [argv, environ, stdin, query_string, body, data, form, args, json, GET, POST, FILES,
+               files, values, cookies, headers, COOKIES, META, query_params, path_params]
+  globals:
+    request: object
+  # Handlers registered with @app.route(...), @bp.get(...), @router.post(...) receive
+  # their parameters from the URL or request body.
+  route_decorators: [route, get, post, put, patch, delete, api_route, websocket]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GUARDS  (Control-Flow Narrowing by validation calls)
+# When a guard call is known to hold (`if guard(p):` body, or after
+# `if not guard(p): abort()`), its Name arguments are refined. Patterns match the
+# resolved call name or its last component.
+# ─────────────────────────────────────────────────────────────────────────────
+guards:
+  # p.startswith(base) only contains p once p is normalised (no '..' segments).
+  normalized_prefix:
+    calls: ["startswith"]
+    receiver: true
+    requires: [NORMALIZED]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  path_containment:
+    calls: ["is_safe*", "*_is_safe*", "*safe_path*", "is_within*", "*_is_within*", "is_subpath*", "*inside_dir*",
+            "is_relative_to"]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  # Allowlist checks: re.fullmatch(pattern, v), or re.match / re.search with a pattern
+  # anchored at the end ($ or \Z); `if not re.match(r"^[a-z0-9]+$", name): abort()`.
+  regex_allowlist_full:
+    calls: ["re.fullmatch", "fullmatch"]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  regex_allowlist_anchored:
+    calls: ["re.match", "re.search"]
+    anchored: true
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  # Character-class checks on the value itself: `if not name.isalnum(): raise`
+  character_allowlist:
+    calls: ["isalnum", "isalpha", "isdigit", "isdecimal", "isnumeric", "isidentifier"]
+    receiver: true
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  # URL allowlist checks before a request or redirect (Django's url_has_allowed_host_and_scheme)
+  url_allowlist:
+    calls: ["url_has_allowed_host_and_scheme", "*is_allowed_url*", "*is_allowed_host*", "*host_is_allowed*",
+            "*url_is_allowed*", "*allowed_domain*"]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VALIDATORS  (calls named as checks of their arguments)
+# A project's own validation helpers: validate_path_is_safe(p), _raise_if_restricted_key(k),
+# sanitize_filename(n), safe_join(base, p). Called as a statement (the usual pattern:
+# it raises when the value is invalid), the Name arguments are validated after the call;
+# used as a value (p = validate_path(p)), the result is. Matched on the last name
+# component with leading underscores removed, and only for calls the schema does not
+# otherwise model. A checker that only returns a bool and is used in an `if` is a guard
+# (see GUARDS), not a validator.
+# ─────────────────────────────────────────────────────────────────────────────
+validators:
+  validation_helpers:
+    calls: ["validate*", "verify_*", "ensure_*safe*", "ensure_*valid*", "check_*safe*", "check_*valid*",
+            "assert_*safe*", "assert_*valid*", "raise_if_*", "reject_*", "sanitize*", "sanitise*", "safe_join"]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+  # SQL quoting and escaping helpers (connection.ops.quote_name(t), escape_string(v))
+  sql_quoting:
+    calls: ["quote_name", "quote_ident*", "*quote_identifier*", "escape_string", "escape_literal", "*escape_sql*"]
+    effect:
+      remove: [EXTERNAL_ORIGIN, DYNAMIC]
+      add: [SANITIZED]
+
+# Calls that never return; a branch ending in one does not reach the code after it.
+# ─────────────────────────────────────────────────────────────────────────────
+control:
+  terminators: [abort, exit, _exit, sys.exit, os._exit, flask.abort, fastapi.HTTPException]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAPABILITIES SECTION  (Effect Algebra)
+# Describes power, not danger. Engine only records use — queries decide policy.
+# ─────────────────────────────────────────────────────────────────────────────
+capabilities:
+  INVOKE_DYNAMIC:
+    consumes: [CODE_LIKE]
+
+  MODIFY_FILESYSTEM:
+    consumes: [TEXTUAL]
+
+  SPAWN_PROCESS:
+    consumes: [TEXTUAL]
+
+  PERFORM_CRYPTO:
+    consumes: [BYTES_LIKE]
+
+  PERFORM_REFLECTION:
+    consumes: [REFLECTIVE]
+
+  # Loading a pickle, YAML (full loader), marshal or shelve stream runs code chosen by
+  # whoever wrote the data
+  DESERIALIZE:
+    consumes: [BYTES_LIKE]
+
+  # Extracting a tar archive writes files at paths chosen by whoever built the archive
+  # (tar slip), unless a member filter is used
+  EXTRACT_ARCHIVE:
+    consumes: []
+
+  # Running an SQL statement (CWE-89 when the statement text is attacker-chosen)
+  EXECUTE_QUERY:
+    consumes: [TEXTUAL]
+
+  # Sending a network request to a URL or host (CWE-918 when it is attacker-chosen)
+  SEND_REQUEST:
+    consumes: [TEXTUAL]
+
+  # Compiling a template from source text (CWE-1336: template syntax runs code)
+  RENDER_TEMPLATE:
+    consumes: [TEXTUAL]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FUNCTION SPECIFICATIONS  (Transformer Layer)
+# Defines how functions modify abstract state.
+# ─────────────────────────────────────────────────────────────────────────────
+functions:
+  # Default rule: applied to any function not explicitly listed
+  "*":
+    match:
+      any: true
+    returns:
+      propagate_args: true
+      dynamic_if_unknown: true
+
+  exec:
+    match:
+      any: true
+    args:
+      0:
+        requires: [CODE_LIKE]
+    produces_capability: INVOKE_DYNAMIC
+
+  eval:
+    match:
+      any: true
+    args:
+      0:
+        requires: [CODE_LIKE]
+    produces_capability: INVOKE_DYNAMIC
+
+  compile:
+    match:
+      any: true
+    args:
+      0:
+        requires: [CODE_LIKE]
+    produces_capability: INVOKE_DYNAMIC
+
+  input:
+    match:
+      any: true
+    returns:
+      type: str
+      adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]
+
+  open:
+    match:
+      any: true
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+    returns:
+      adds: [EXTERNAL_ORIGIN, DYNAMIC]
+
+  flask.send_file:
+    match:
+      module: flask
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  os.remove:
+    match:
+      module: os
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  os.unlink:
+    match:
+      module: os
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  os.rmdir:
+    match:
+      module: os
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  shutil.rmtree:
+    match:
+      module: shutil
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  shutil.copy:
+    match:
+      module: shutil
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  shutil.copyfile:
+    match:
+      module: shutil
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  shutil.move:
+    match:
+      module: shutil
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: MODIFY_FILESYSTEM
+
+  read:
+    match:
+      any: true
+    returns:
+      adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]
+
+  readline:
+    match:
+      any: true
+    returns:
+      adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]
+
+  base64.b64decode:
+    match:
+      module: base64
+    returns:
+      adds: [BYTES_LIKE, DYNAMIC, CODE_LIKE]
+
+  base64.b64encode:
+    match:
+      module: base64
+    returns:
+      adds: [BYTES_LIKE, DYNAMIC]
+
+  os.system:
+    match:
+      module: os
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: SPAWN_PROCESS
+
+  os.popen:
+    match:
+      module: os
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: SPAWN_PROCESS
+
+  subprocess.run:
+    match:
+      module: subprocess
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: SPAWN_PROCESS
+
+  subprocess.Popen:
+    match:
+      module: subprocess
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: SPAWN_PROCESS
+
+  subprocess.call:
+    match:
+      module: subprocess
+    args:
+      0:
+        requires: [TEXTUAL]
+    produces_capability: SPAWN_PROCESS
+
+  hashlib.md5:
+    match:
+      module: hashlib
+    args:
+      0:
+        requires: [BYTES_LIKE]
+    produces_capability: PERFORM_CRYPTO
+
+  hashlib.sha1:
+    match:
+      module: hashlib
+    args:
+      0:
+        requires: [BYTES_LIKE]
+    produces_capability: PERFORM_CRYPTO
+
+  len:
+    match:
+      any: true
+    returns:
+      type: int
+      adds: [NUMERIC]
+      dynamic_if_unknown: true
+
+  str:
+    match:
+      any: true
+    returns:
+      type: str
+      adds: [TEXTUAL]
+      propagate_args: true
+
+  int:
+    match:
+      any: true
+    returns:
+      type: int
+      adds: [NUMERIC, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL, CODE_LIKE]
+      propagate_args: true
+
+  bytes:
+    match:
+      any: true
+    returns:
+      type: bytes
+      adds: [BYTES_LIKE]
+      propagate_args: true
+
+  # vvv Sanitisers vvv
+  # Return values lose EXTERNAL_ORIGIN (and DYNAMIC where the output is safe
+  # to splice into a shell command or code). Joins still over-approximate:
+  # `unknown + shlex.quote(x)` stays DYNAMIC because of `unknown`.
+  shlex.quote:
+    match:
+      module: shlex
+    returns:
+      type: str
+      adds: [TEXTUAL, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, DYNAMIC, CODE_LIKE]
+      propagate_args: true
+
+  shlex.join:
+    match:
+      module: shlex
+    returns:
+      type: str
+      adds: [TEXTUAL, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, DYNAMIC, CODE_LIKE]
+      propagate_args: true
+
+  os.path.abspath:
+    match:
+      module: os.path
+    returns:
+      type: str
+      adds: [TEXTUAL, NORMALIZED]
+      propagate_args: true
+
+  os.path.realpath:
+    match:
+      module: os.path
+    returns:
+      type: str
+      adds: [TEXTUAL, NORMALIZED]
+      propagate_args: true
+
+  os.path.normpath:
+    match:
+      module: os.path
+    returns:
+      type: str
+      adds: [TEXTUAL, NORMALIZED]
+      propagate_args: true
+
+  # secure_filename() strips separators and '..': like basename(), it blocks traversal
+  # but the name stays runtime-chosen (DYNAMIC).
+  werkzeug.utils.secure_filename:
+    match:
+      module: werkzeug.utils
+    returns:
+      type: str
+      adds: [TEXTUAL, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, CODE_LIKE]
+      propagate_args: true
+
+  # basename() blocks path traversal but the file name is still runtime-chosen,
+  # so the value stays DYNAMIC (filesystem_dynamic_path, low).
+  os.path.basename:
+    match:
+      module: os.path
+    returns:
+      type: str
+      adds: [TEXTUAL, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, CODE_LIKE]
+      propagate_args: true
+
+  float:
+    match:
+      any: true
+    returns:
+      type: float
+      adds: [NUMERIC, SANITIZED]
+      removes: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL, CODE_LIKE]
+      propagate_args: true
+
+  # vvv More process creation vvv
+  subprocess.check_output:
+    match: {module: subprocess}
+    produces_capability: SPAWN_PROCESS
+    returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]}
+
+  subprocess.check_call:
+    match: {module: subprocess}
+    produces_capability: SPAWN_PROCESS
+
+  subprocess.getoutput:
+    match: {module: subprocess}
+    produces_capability: SPAWN_PROCESS
+    returns: {type: str, adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]}
+
+  subprocess.getstatusoutput:
+    match: {module: subprocess}
+    produces_capability: SPAWN_PROCESS
+    returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]}
+
+  asyncio.create_subprocess_shell:
+    match: {module: asyncio}
+    produces_capability: SPAWN_PROCESS
+
+  asyncio.create_subprocess_exec:
+    match: {module: asyncio}
+    produces_capability: SPAWN_PROCESS
+
+  os.execv:   {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.execve:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.execvp:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.execvpe: {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.execl:   {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.execlp:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.spawnv:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.spawnvp: {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.spawnl:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.spawnlp: {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.posix_spawn:  {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  os.posix_spawnp: {match: {module: os}, produces_capability: SPAWN_PROCESS}
+  pty.spawn:  {match: {module: pty}, produces_capability: SPAWN_PROCESS}
+
+  # vvv More file access vvv
+  shutil.copy2:         {match: {module: shutil}, produces_capability: MODIFY_FILESYSTEM}
+  shutil.copytree:      {match: {module: shutil}, produces_capability: MODIFY_FILESYSTEM}
+  os.rename:            {match: {module: os}, produces_capability: MODIFY_FILESYSTEM}
+  os.replace:           {match: {module: os}, produces_capability: MODIFY_FILESYSTEM}
+  os.symlink:           {match: {module: os}, produces_capability: MODIFY_FILESYSTEM}
+  io.open:              {match: {module: io}, produces_capability: MODIFY_FILESYSTEM, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  codecs.open:          {match: {module: codecs}, produces_capability: MODIFY_FILESYSTEM, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  flask.send_from_directory:   # joins safely (safe_join) and 404s on traversal
+    match: {module: flask}
+    returns: {propagate_args: true}
+  aiohttp.web.FileResponse:           {match: {module: aiohttp.web}, produces_capability: MODIFY_FILESYSTEM}
+  starlette.responses.FileResponse:   {match: {module: starlette.responses}, produces_capability: MODIFY_FILESYSTEM}
+  fastapi.responses.FileResponse:     {match: {module: fastapi.responses}, produces_capability: MODIFY_FILESYSTEM}
+  django.http.FileResponse:           {match: {module: django.http}, produces_capability: MODIFY_FILESYSTEM}
+
+  # vvv pathlib paths vvv
+  pathlib.Path:            {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+  pathlib.PurePath:        {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+  pathlib.PosixPath:       {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+  pathlib.WindowsPath:     {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+  pathlib.PurePosixPath:   {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+  pathlib.PureWindowsPath: {match: {module: pathlib}, returns: {type: path, adds: [TEXTUAL], propagate_args: true}}
+
+  # vvv Archives vvv
+  tarfile.open:    {match: {module: tarfile}, returns: {type: archive, propagate_args: true}}
+  tarfile.TarFile: {match: {module: tarfile}, returns: {type: archive, propagate_args: true}}
+  shutil.unpack_archive:
+    match: {module: shutil}
+    produces_capability: EXTRACT_ARCHIVE
+    safe_args:
+      filter: {position: 3, values: [data, tar, fully_trusted_filter, data_filter, tar_filter]}
+
+  # vvv Deserialisation vvv
+  pickle.load:   {match: {module: pickle}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  pickle.loads:  {match: {module: pickle}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  pickle.Unpickler: {match: {module: pickle}, produces_capability: DESERIALIZE}
+  cPickle.load:  {match: {module: cPickle}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  cPickle.loads: {match: {module: cPickle}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  dill.load:     {match: {module: dill}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  dill.loads:    {match: {module: dill}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  marshal.load:  {match: {module: marshal}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  marshal.loads: {match: {module: marshal}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  shelve.open:   {match: {module: shelve}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  jsonpickle.decode: {match: {module: jsonpickle}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  pandas.read_pickle: {match: {module: pandas}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  yaml.unsafe_load:   {match: {module: yaml}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  yaml.full_load:     {match: {module: yaml}, produces_capability: DESERIALIZE, returns: {adds: [DYNAMIC]}}
+  # yaml.load / load_all are safe only with a safe loader (PyYAML < 5.1 defaults to the
+  # full, code-running loader; later versions require Loader= and warn without it)
+  yaml.load:
+    match: {module: yaml}
+    produces_capability: DESERIALIZE
+    returns: {adds: [DYNAMIC]}
+    safe_args:
+      Loader: {position: 1, values: [SafeLoader, CSafeLoader, BaseLoader, CBaseLoader]}
+  yaml.load_all:
+    match: {module: yaml}
+    produces_capability: DESERIALIZE
+    returns: {adds: [DYNAMIC]}
+    safe_args:
+      Loader: {position: 1, values: [SafeLoader, CSafeLoader, BaseLoader, CBaseLoader]}
+
+  # vvv SQL statements (CWE-89) vvv
+  # Only the statement text is a sink argument: cursor.execute(sql, params) with
+  # tainted params is a parameterised query. cursor.execute and friends are METHODS.
+  sqlalchemy.text:                       {match: {module: sqlalchemy}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [text]}, returns: {propagate_args: true}}
+  sqlalchemy.sql.text:                   {match: {module: sqlalchemy.sql}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [text]}, returns: {propagate_args: true}}
+  sqlalchemy.sql.expression.text:        {match: {module: sqlalchemy.sql.expression}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [text]}, returns: {propagate_args: true}}
+  django.db.models.RawSQL:               {match: {module: django.db.models}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql]}, returns: {propagate_args: true}}
+  django.db.models.expressions.RawSQL:   {match: {module: django.db.models.expressions}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql]}, returns: {propagate_args: true}}
+  pandas.read_sql:                       {match: {module: pandas}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  pandas.read_sql_query:                 {match: {module: pandas}, produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  # Composed SQL: identifiers and literals are quoted by the driver
+  psycopg2.sql.Identifier:  {match: {module: psycopg2.sql}, returns: {type: str, adds: [TEXTUAL, SANITIZED], removes: [EXTERNAL_ORIGIN, DYNAMIC], propagate_args: true}}
+  psycopg2.sql.Literal:     {match: {module: psycopg2.sql}, returns: {type: str, adds: [TEXTUAL, SANITIZED], removes: [EXTERNAL_ORIGIN, DYNAMIC], propagate_args: true}}
+  psycopg.sql.Identifier:   {match: {module: psycopg.sql}, returns: {type: str, adds: [TEXTUAL, SANITIZED], removes: [EXTERNAL_ORIGIN, DYNAMIC], propagate_args: true}}
+  psycopg.sql.Literal:      {match: {module: psycopg.sql}, returns: {type: str, adds: [TEXTUAL, SANITIZED], removes: [EXTERNAL_ORIGIN, DYNAMIC], propagate_args: true}}
+  sqlalchemy.bindparam:     {match: {module: sqlalchemy}, returns: {adds: [CONSTANT]}}
+
+  # vvv Outgoing requests (CWE-918) vvv
+  # The URL (or host) is the sink argument. Response data comes from the network, so it
+  # is external, like data read from a file.
+  requests.get: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.get: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.post: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.post: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.put: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.put: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.patch: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.patch: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.delete: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.delete: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.head: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.head: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.options: {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.options: {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  requests.request:   {match: {module: requests}, produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.request:      {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  httpx.stream:       {match: {module: httpx}, produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  aiohttp.request:    {match: {module: aiohttp}, produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urllib3.request:    {match: {module: urllib3}, produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urllib.request.urlopen:   {match: {module: urllib.request}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urllib.request.urlretrieve: {match: {module: urllib.request}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urllib.request.Request:   {match: {module: urllib.request}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {propagate_args: true}}
+  urllib2.urlopen:          {match: {module: urllib2}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urllib.urlopen:           {match: {module: urllib}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  http.client.HTTPConnection:  {match: {module: http.client}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [host]}, returns: {type: http_client}}
+  http.client.HTTPSConnection: {match: {module: http.client}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [host]}, returns: {type: http_client}}
+  socket.create_connection:    {match: {module: socket}, produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [address]}}
+  requests.Session:        {match: {module: requests}, returns: {type: http_client}}
+  requests.session:        {match: {module: requests}, returns: {type: http_client}}
+  httpx.Client:            {match: {module: httpx}, returns: {type: http_client}}
+  httpx.AsyncClient:       {match: {module: httpx}, returns: {type: http_client}}
+  aiohttp.ClientSession:   {match: {module: aiohttp}, returns: {type: http_client}}
+  urllib3.PoolManager:     {match: {module: urllib3}, returns: {type: http_client}}
+  urllib3.ProxyManager:    {match: {module: urllib3}, returns: {type: http_client}}
+
+  # vvv Templates compiled from source text (CWE-1336) vvv
+  # Rendering a template file by name (render_template) is not a sink; compiling
+  # template source that an attacker controls runs their template code.
+  jinja2.Template:                {match: {module: jinja2}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [source]}, returns: {propagate_args: true}}
+  jinja2.environment.Template:    {match: {module: jinja2.environment}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [source]}, returns: {propagate_args: true}}
+  flask.render_template_string:   {match: {module: flask}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [source]}, returns: {propagate_args: true}}
+  django.template.Template:       {match: {module: django.template}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [template_string]}, returns: {propagate_args: true}}
+  django.template.base.Template:  {match: {module: django.template.base}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [template_string]}, returns: {propagate_args: true}}
+  mako.template.Template:         {match: {module: mako.template}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [text]}, returns: {propagate_args: true}}
+  tornado.template.Template:      {match: {module: tornado.template}, produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [template_string]}, returns: {propagate_args: true}}
+  jinja2.sandbox.SandboxedEnvironment:          {match: {module: jinja2.sandbox}, returns: {type: sandbox_env}}
+  jinja2.sandbox.ImmutableSandboxedEnvironment: {match: {module: jinja2.sandbox}, returns: {type: sandbox_env}}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METHOD SPECIFICATIONS
+# obj.<method>(...) calls the FUNCTIONS table does not know by name. A spec applies
+# only when the receiver has one of receiver_types; the receiver counts as the
+# call's first argument (it is the path being opened, the archive being extracted).
+# ─────────────────────────────────────────────────────────────────────────────
+methods:
+  read_text:   {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM, returns: {type: str, adds: [EXTERNAL_ORIGIN, DYNAMIC, TEXTUAL]}}
+  read_bytes:  {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC, BYTES_LIKE]}}
+  write_text:  {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  write_bytes: {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  open:        {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  unlink:      {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  rmdir:       {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  rename:      {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  replace:     {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  touch:       {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  symlink_to:  {receiver_types: [path], produces_capability: MODIFY_FILESYSTEM}
+  extractall:
+    receiver_types: [archive]
+    produces_capability: EXTRACT_ARCHIVE
+    safe_args:
+      filter: {values: ["*"]}
+  extract:
+    receiver_types: [archive]
+    produces_capability: EXTRACT_ARCHIVE
+    safe_args:
+      filter: {values: ["*"]}
+
+  # SQL: cursor.execute(sql, params), session.execute(sql), Model.objects.raw(sql),
+  # qs.extra(where=[...]). Any receiver: the cursor usually comes from a helper.
+  execute:       {receiver_types: ["*"], produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql, query, operation, statement]}, returns: {propagate_args: true}}
+  executemany:   {receiver_types: ["*"], produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql, query, operation]}, returns: {propagate_args: true}}
+  executescript: {receiver_types: ["*"], produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [sql_script]}, returns: {propagate_args: true}}
+  raw:           {receiver_types: ["*"], produces_capability: EXECUTE_QUERY, sink_args: {positions: [0], keywords: [raw_query]}, returns: {propagate_args: true}}
+  extra:         {receiver_types: ["*"], produces_capability: EXECUTE_QUERY, sink_args: {positions: [], keywords: [where, select, tables, order_by]}, returns: {propagate_args: true}}
+  # Requests through a client session
+  get: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  post: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  put: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  patch: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  delete: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  head: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  options: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  ws_connect: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [0], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  request: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  stream: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  urlopen: {receiver_types: [http_client], produces_capability: SEND_REQUEST, sink_args: {positions: [1], keywords: [url]}, returns: {adds: [EXTERNAL_ORIGIN, DYNAMIC]}}
+  # Templates: env.from_string(source), except on a sandboxed Jinja environment
+  from_string:   {receiver_types: ["*"], excluded_receivers: [sandbox_env], produces_capability: RENDER_TEMPLATE, sink_args: {positions: [0], keywords: [source]}, returns: {propagate_args: true}}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# OPERATOR SEMANTICS
+# Transfer rules for AST binary/comparison operators.
+# ─────────────────────────────────────────────────────────────────────────────
+operators:
+  Add:
+    propagate: true
+
+  Sub:
+    propagate: true
+
+  Mult:
+    propagate: true
+
+  Mod:
+    propagate: true
+
+  # Also pathlib's  base / name
+  Div:
+    propagate: true
+
+  Compare:
+    returns:
+      type: bool
+      adds: []
+
+  In:
+    refinement: membership
+
+  Eq:
+    refinement: equality_constant
+
+  NotEq:
+    returns:
+      type: bool
+      adds: []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REFINEMENTS  (Control-Flow Narrowing)
+# Applied at branch conditions to narrow abstract values.
+# ─────────────────────────────────────────────────────────────────────────────
+refinements:
+  membership:
+    pattern: finite_set
+    effect:
+      remove: [DYNAMIC]
+      add: [FINITE_DOMAIN]
+
+  isinstance:
+    effect:
+      narrow_type: true
+
+  equality_constant:
+    effect:
+      remove: [DYNAMIC]
+      add: [CONSTANT]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# QUERY SYSTEM  (Reasoning / Policy Layer)
+# Queries define what is problematic. Engine never decides this.
+# ─────────────────────────────────────────────────────────────────────────────
+queries:
+  dynamic_execution_external:
+    when:
+      capability: INVOKE_DYNAMIC
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: critical
+
+  dynamic_execution_decoded:
+    when:
+      capability: INVOKE_DYNAMIC
+      argument_has: [CODE_LIKE, DYNAMIC]
+    severity: critical
+
+  dynamic_execution_unknown:
+    when:
+      capability: INVOKE_DYNAMIC
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT, EXTERNAL_ORIGIN]
+    severity: medium
+
+  dynamic_execution_constant:
+    when:
+      capability: INVOKE_DYNAMIC
+      argument_has: [CONSTANT]
+      argument_lacks: [DYNAMIC, EXTERNAL_ORIGIN]
+    severity: low
+
+  filesystem_external_input:
+    when:
+      capability: MODIFY_FILESYSTEM
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  # Low, not medium: a path that arrives as a function parameter is DYNAMIC when the
+  # function is analysed on its own, so this fires on most real open() calls. Tainted
+  # paths (filesystem_external_input), also when followed through function summaries,
+  # remain high.
+  filesystem_dynamic_path:
+    when:
+      capability: MODIFY_FILESYSTEM
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT]
+    severity: low
+
+  spawn_external_command:
+    when:
+      capability: SPAWN_PROCESS
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: critical
+
+  spawn_dynamic_command:
+    when:
+      capability: SPAWN_PROCESS
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT]
+    severity: high
+
+  reflective_chain:
+    when:
+      capability: PERFORM_REFLECTION
+      argument_has: [DYNAMIC]
+    severity: medium
+
+  reflective_external:
+    when:
+      capability: PERFORM_REFLECTION
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  # Any use of a broken hash (MD5/SHA-1) is a finding. Previously only
+  # crypto_external_data existed, so a constant or parameter argument never fired.
+  weak_hash_used:
+    when:
+      capability: PERFORM_CRYPTO
+    severity: medium
+
+  crypto_external_data:
+    when:
+      capability: PERFORM_CRYPTO
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: low
+
+  # Unsafe deserialisation: high when the data comes from outside (a request, a file
+  # or socket read), medium when its origin is unknown
+  deserialize_external:
+    when:
+      capability: DESERIALIZE
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  deserialize_dynamic:
+    when:
+      capability: DESERIALIZE
+      argument_has: [DYNAMIC]
+      argument_lacks: [EXTERNAL_ORIGIN]
+    severity: medium
+
+  # Tar extraction without a member filter (tar slip), whatever the archive's path
+  archive_extraction_external:
+    when:
+      capability: EXTRACT_ARCHIVE
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  archive_extraction_unfiltered:
+    when:
+      capability: EXTRACT_ARCHIVE
+      argument_lacks: [EXTERNAL_ORIGIN]
+    severity: medium
+
+  # SQL injection: statement text from outside (high) or built at run time (low, as for
+  # file paths: a function parameter is dynamic when the function is analysed alone)
+  sql_external_query:
+    when:
+      capability: EXECUTE_QUERY
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  sql_dynamic_query:
+    when:
+      capability: EXECUTE_QUERY
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT, EXTERNAL_ORIGIN]
+    severity: low
+
+  # Server-side request forgery: request URL or host from outside
+  ssrf_external_url:
+    when:
+      capability: SEND_REQUEST
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: high
+
+  ssrf_dynamic_url:
+    when:
+      capability: SEND_REQUEST
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT, EXTERNAL_ORIGIN]
+    severity: low
+
+  # Template injection: template source from outside runs template code (critical,
+  # as for exec), built at run time (low)
+  template_external_source:
+    when:
+      capability: RENDER_TEMPLATE
+      argument_has: [EXTERNAL_ORIGIN]
+    severity: critical
+
+  template_dynamic_source:
+    when:
+      capability: RENDER_TEMPLATE
+      argument_has: [DYNAMIC]
+      argument_lacks: [CONSTANT, EXTERNAL_ORIGIN]
+    severity: low
